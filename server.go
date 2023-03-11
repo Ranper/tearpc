@@ -148,7 +148,7 @@ func (s *Server) ReadRequsetHead(cc codec.Codec) (*codec.Header, error) {
 func (s *Server) Accept(listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
-		log.Println("test 333")
+		log.Println("Server: accpt a new connect: ", conn.RemoteAddr())
 
 		if err != nil {
 			log.Println("Accept Err: ", listener.Addr().String(), err.Error())

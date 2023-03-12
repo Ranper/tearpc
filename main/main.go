@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"tearpc"
@@ -26,13 +27,17 @@ func main() {
 
 	time.Sleep(time.Second)
 	client := tearpc.Dial("tcp", addr)
-	var reply string
-	call := &tearpc.Call{
-		ServerMethod: "Foo.Sum",
-		Argv:         "666",
-		Reply:        &reply, // 这传入返回类型的地址
+
+	for i := 1; i < 10; i++ {
+		var reply string // 每次发请求的时候,清空
+
+		call := &tearpc.Call{
+			ServerMethod: "Foo.Sum",
+			Argv:         fmt.Sprintf("input of call [%v]", i),
+			Reply:        &reply, // 这传入返回类型的地址
+		}
+		log.Println("Client: begin to call! idx=", i)
+		client.Call(call) // 这里是阻塞的
+		log.Printf("i=%d, reply=%v", i, reply)
 	}
-	log.Println("Client: begin to call!")
-	client.Call(call) // 这里是阻塞的
-	log.Println("reply:", reply)
 }

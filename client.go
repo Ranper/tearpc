@@ -2,6 +2,7 @@ package tearpc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -76,16 +77,42 @@ func funcTimeCost() func(string) {
 	}
 }
 
+// 封装异步调用
+// 在内部构造 call 结构体
+func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Call) *Call {
+	if done == nil {
+		done = make(chan *Call, 10)
+	} else if cap(done) == 0 {
+		log.Panic("Client: done channel is unbuffered")
+	}
+	call := &Call{
+		ServerMethod: ServerMethon,
+		Argv:         argv,
+		Reply:        reply,
+		Done:         done,
+	}
+	c.send(call)
+	return call
+}
+
 func (c *Client) Call(call *Call) {
 	if call.Done == nil {
 		call.Done = make(chan *Call, 10)
 	}
-	defer funcTimeCost()(fmt.Sprintf("call: %s", call.ServerMethod))
+	defer funcTimeCost()(fmt.Sprintf("call: %s, Argv=%d", call.ServerMethod, call.Argv))
 	<-c.send(call).Done // 当receive 接收到 返回值的时候, 会向Done 通道写消息来通知,然后这里就可以返回了; 如果是异步的话,可以返回一个channel
 }
 
 func Done(call *Call) {
 	<-call.Done // wait call finish
+}
+
+func (c *Client) removeCall(seqId uint64) *Call {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	call := c.pending[seqId]
+	delete(c.pending, seqId)
+	return call
 }
 
 // 读取 cc的消息
@@ -97,26 +124,50 @@ func receive(client *Client, cc codec.Codec) {
 		err = cc.ReadHead(&header)
 		if err != nil {
 			log.Println("receive: ReadHead err:", err.Error())
-			continue
+			// continue // 接收头部有问题,直接break
+			break
 		}
-		log.Println("receive head", header.Seq)
-		call := client.pending[header.Seq]
 
-		if call == nil {
+		log.Println("receive head", header.Seq)
+		// call := client.pending[header.Seq] //? Note:收到请求后这里要删除对应的call, 否则内存无法释放
+		call := client.removeCall(header.Seq)
+
+		switch { // swich 是可以不带表达式的,直接在case里面判断
+		case call == nil:
 			log.Printf("call [is = %v] is not in client.pending", header.Seq)
+			err = cc.ReadBody(nil)
+		case header.Err != "":
+			log.Printf("receive: ReadBody: err: %v", header.Err)
+
+			/*
+				2023/03/11 17:00:32 receive: ReadHead err: gob: type mismatch in decoder: want struct type codec.Header; got non-struct
+				2023/03/11 17:00:32 Client: encounter error:  gob: type mismatch in decoder: want struct type codec.Header; got non-struct
+
+				当客户端试图读取的类型与服务器写入的类型不一致时
+			*/
+			err = cc.ReadBody(nil)
 			call.done()
-			continue
-		}
-		call.Error = header.Err
-		err = cc.ReadBody(call.Reply)
-		if err != nil {
-			log.Printf("receive: ReadBody: err: %v", err.Error())
+		case header.Err == "":
+			err = cc.ReadBody(call.Reply) //从body中读取数据到 call.replay中
+			log.Println("Client: No Err: Reply: **, head.req", header.Seq)
 			call.done()
-			continue
 		}
-		call.done()
-		log.Printf("receive reply: id=%v, reply=%v, err=%v", header.Seq, call.Reply, call.Error)
 	}
+	// log.Println("Client: encounter error: ", err.Error())
+	client.terminalClient()
+}
+
+var ErrShutDown = errors.New("Client ShutDown")
+
+func (c *Client) terminalClient() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, call_ptr := range c.pending {
+		call_ptr.Error = ErrShutDown.Error()
+		call_ptr.done()
+	}
+
 }
 
 // send
@@ -136,6 +187,11 @@ func (c *Client) send(call *Call) *Call {
 
 	if err := c.cc.Write(c.header, call.Argv); err != nil {
 		log.Println("Client Write err: ", err.Error())
+		call := c.removeCall(seq) // 这里发送失败要立即通知调用方哦
+		if call != nil {
+			call.Error = err.Error()
+			call.done()
+		}
 	}
 	return call
 }

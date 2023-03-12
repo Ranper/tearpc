@@ -11,11 +11,6 @@ import (
 	"tearpc/codec" // 以最后一个/后面的内容作为imported 的name
 )
 
-/*
-TODO
-1、需要增加sync.Wait, 在连接发生错误的时候,要等所有协程处理完成后再关闭连接
-2、sending的时候增加mutex保护
-*/
 type Option struct {
 	MagicNumber uint32
 	CodecType   codec.Type
@@ -68,6 +63,16 @@ func (s *Server) NewConnAccepted(conn io.ReadWriteCloser) {
 
 var invalidRequest = struct{}{} // 初始化一个空结构体
 
+type TestStruct struct {
+	Num  uint64
+	Name string
+}
+
+var testStruct = TestStruct{
+	Num:  16,
+	Name: "zhangsan",
+}
+
 // 三次握手, 发送opt选项之后, 在这里主循环, 接受 Request && handle request
 func (s *Server) ServerConnLoop(cc codec.Codec) {
 	// defer func() { _ = cc.Close() }() // 退出的时候关闭cc
@@ -76,6 +81,8 @@ func (s *Server) ServerConnLoop(cc codec.Codec) {
 	wg := &sync.WaitGroup{}
 	for {
 		req, err := s.ReadRequest(cc)
+		// test code
+		// err = errors.New("test err")  // 打开这个注释, 会向客户端发送空结构体,客户端就不能再用string类型的变量去接收了
 		if err != nil {
 			if req == nil { // header 解析失败,可以退出了 //! 为什么这里break, continue不行吗
 				break
@@ -108,7 +115,7 @@ func (s *Server) HandleRequest(cc codec.Codec, req *Request, wg *sync.WaitGroup,
 	defer wg.Done() // 走完整个处理流程后执行 wg.Done,defer是在本函数退出的时候才执行
 
 	req.ReplyArgv = reflect.ValueOf(fmt.Sprintf("TeaRpc Replay: %v", req.Header.Seq))
-	log.Printf("HandleRequest: req.Seq=%d, Reply=%s", req.Header.Seq, req.ReplyArgv)
+	log.Printf("HandleRequest: req.Seq=%d, argv=%v, Reply=%s", req.Header.Seq, req.Argv.Elem(), req.ReplyArgv)
 	// send response
 	s.SendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
 }
@@ -130,7 +137,7 @@ func (s *Server) ReadRequest(cc codec.Codec) (*Request, error) {
 		log.Println("ReadRequest: ReadBody err: ", err.Error())
 		return req, err
 	}
-
+	log.Println("argv:", req.Argv.Elem())
 	return req, nil
 }
 

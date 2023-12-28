@@ -18,11 +18,11 @@ type Call struct {
 	ServerMethod string // user assignment // 赋值
 	Argv         interface{}
 	Reply        interface{}
-	Error        string
+	Error        error
 	Done         chan *Call
 }
 
-// 当一次 call调用接收到rps的时候,调用done函数,向chan 发送消息,标识已经完成
+// 当一次 call调用接收到rpc的时候,调用done函数,向chan 发送消息,标识已经完成
 func (c *Call) done() {
 	c.Done <- c
 }
@@ -39,6 +39,7 @@ type Client struct {
 	shutdown bool
 }
 
+// client的构造函数
 func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	client := &Client{
 		cc:       cc,
@@ -57,17 +58,20 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return client
 }
 
-// 根据opt 创建codec,
-func NewClient(conn io.ReadWriteCloser, opt *Option) *Client {
-	createCodecFunc := codec.CodccMap[opt.CodecType]
+// 根据opt, 在已经建立连接的socket上建立client对象
+func NewClient(conn io.ReadWriteCloser, opt *Option) (client *Client, err error) {
+	createCodecFunc := codec.NewCodecFuncMap[opt.CodecType]
 	if createCodecFunc == nil {
-		log.Println("NewClient: ERR: createCodecFunc is nil " + opt.CodecType)
-		return nil
+		err := fmt.Errorf("NewClient: invalid codec type %s", opt.CodecType)
+		log.Println("rpc client: codec err: ", err)
+		return nil, err
 	}
 	// 经过确认 opt没问题了再发送
 	_ = json.NewEncoder(conn).Encode(opt) // 发送option
+	log.Println("Client: send opt done!")
 
-	return newClientCodec(createCodecFunc((conn)), opt)
+	// newClientCodec 不可能出问题
+	return newClientCodec(createCodecFunc((conn)), opt), nil
 }
 
 func funcTimeCost() func(string) {
@@ -80,6 +84,7 @@ func funcTimeCost() func(string) {
 // 封装异步调用
 // 在内部构造 call 结构体
 func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Call) *Call {
+	// 因为使用了有缓冲的channel, 所以是非阻塞的
 	if done == nil {
 		done = make(chan *Call, 10)
 	} else if cap(done) == 0 {
@@ -95,12 +100,18 @@ func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Cal
 	return call
 }
 
-func (c *Client) Call(call *Call) {
-	if call.Done == nil {
-		call.Done = make(chan *Call, 10)
-	}
-	defer funcTimeCost()(fmt.Sprintf("call: %s, Argv=%d", call.ServerMethod, call.Argv))
-	<-c.send(call).Done // 当receive 接收到 返回值的时候, 会向Done 通道写消息来通知,然后这里就可以返回了; 如果是异步的话,可以返回一个channel
+// 阻塞调用
+func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
+	// if call.Done == nil {
+	// 	call.Done = make(chan *Call, 10)
+	// }
+	defer funcTimeCost()(fmt.Sprintf("call: %s, Argv=%d", serviceMethod, args))
+	// 当前call没有收到回报的时候,会阻塞在当前语句, 直到调用done()函数,向通道写入内容
+	// <-c.send(call).Done // 当receive 接收到 返回值的时候, 会向Done 通道写消息来通知,然后这里就可以返回了; 如果是异步的话,可以返回一个channel
+
+	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	return call.Error
+
 }
 
 func Done(call *Call) {
@@ -108,9 +119,9 @@ func Done(call *Call) {
 }
 
 func (c *Client) removeCall(seqId uint64) *Call {
-	c.mu.Lock()
+	c.mu.Lock() // 操作共享资源, 加锁
 	defer c.mu.Unlock()
-	call := c.pending[seqId]
+	call := c.pending[seqId] // 从pending列表里面删除对应的序列号
 	delete(c.pending, seqId)
 	return call
 }
@@ -121,14 +132,13 @@ func receive(client *Client, cc codec.Codec) {
 	for err == nil {
 		var header codec.Header
 		// log.Println("receive  run")
-		err = cc.ReadHead(&header)
+		err = cc.ReadHeader(&header)
 		if err != nil {
-			log.Println("receive: ReadHead err:", err.Error())
+			// log.Println("Client receive: ReadHeader err:", err.Error())
 			// continue // 接收头部有问题,直接break
 			break
 		}
 
-		log.Println("receive head", header.Seq)
 		// call := client.pending[header.Seq] //? Note:收到请求后这里要删除对应的call, 否则内存无法释放
 		call := client.removeCall(header.Seq)
 
@@ -136,35 +146,34 @@ func receive(client *Client, cc codec.Codec) {
 		case call == nil:
 			log.Printf("call [is = %v] is not in client.pending", header.Seq)
 			err = cc.ReadBody(nil)
-		case header.Err != "":
-			log.Printf("receive: ReadBody: err: %v", header.Err)
+		case header.Error != "":
+			log.Printf("receive: ReadBody: err: %v", header.Error)
 
 			/*
-				2023/03/11 17:00:32 receive: ReadHead err: gob: type mismatch in decoder: want struct type codec.Header; got non-struct
+				2023/03/11 17:00:32 receive: ReadHeader err: gob: type mismatch in decoder: want struct type codec.Header; got non-struct
 				2023/03/11 17:00:32 Client: encounter error:  gob: type mismatch in decoder: want struct type codec.Header; got non-struct
 
 				当客户端试图读取的类型与服务器写入的类型不一致时
 			*/
 			err = cc.ReadBody(nil)
 			call.done()
-		case header.Err == "":
+		case header.Error == "":
 			err = cc.ReadBody(call.Reply) //从body中读取数据到 call.replay中
-			log.Println("Client: No Err: Reply: **, head.req", header.Seq)
 			call.done()
 		}
 	}
 	// log.Println("Client: encounter error: ", err.Error())
-	client.terminalClient()
+	client.terminalClient(err)
 }
 
 var ErrShutDown = errors.New("Client ShutDown")
 
-func (c *Client) terminalClient() {
+func (c *Client) terminalClient(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, call_ptr := range c.pending {
-		call_ptr.Error = ErrShutDown.Error()
+		call_ptr.Error = err
 		call_ptr.done()
 	}
 
@@ -182,14 +191,13 @@ func (c *Client) send(call *Call) *Call {
 	seq, _ := c.registerCall(call) // 因为header结构每个call 可以复用,所以把header放在了client上
 
 	c.header.Seq = seq
-	c.header.Err = ""
+	c.header.Error = ""
 	c.header.ServerMethod = call.ServerMethod
-
 	if err := c.cc.Write(c.header, call.Argv); err != nil {
 		log.Println("Client Write err: ", err.Error())
 		call := c.removeCall(seq) // 这里发送失败要立即通知调用方哦
 		if call != nil {
-			call.Error = err.Error()
+			call.Error = err
 			call.done()
 		}
 	}
@@ -215,18 +223,34 @@ func (c *Client) registerCall(call *Call) (uint64, error) {
 	return call.Seq, nil
 }
 
-func parseOption() (Option, error) {
-	return DefaultOption, nil
+func parseOptions(opts ...*Option) (*Option, error) {
+	// 没传参数,或者传递的第一个参数为nil
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+
+	opt := opts[0]
+	opt.MagicNumber = DefaultMagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
 }
 
 // dial 服务器, 发送opt
-func Dial(work string, addr chan string, opt ...*Option) *Client {
-	option, _ := parseOption()
+func Dial(work string, addr chan string, opts ...*Option) (client *Client, err error) {
+	option, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
 
 	conn, err := net.Dial(work, <-addr)
 	if err != nil {
 		log.Println("Dial failed")
-		return nil
+		return nil, err
 	}
 	log.Println("Dial succedd! ", conn.RemoteAddr().String())
 
@@ -236,5 +260,15 @@ func Dial(work string, addr chan string, opt ...*Option) *Client {
 		}
 	}()
 
-	return NewClient(conn, &option)
+	return NewClient(conn, option)
+}
+
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return ErrShutDown
+	}
+	c.closing = true
+	return c.cc.Close()
 }

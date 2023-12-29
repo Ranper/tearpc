@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -9,21 +8,34 @@ import (
 	"time"
 )
 
+type Foo int
+type Args struct{ Num1, Num2 int }
+
+func (f Foo) Sum(args Args, reply *int) error {
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
 func startServer(addr chan string) {
-	listen_addr := ":0" // 这里不要固定使用一个端口, 否则频繁启动的时候会有问题
-	listener, err := net.Listen("tcp", listen_addr)
+	var foo Foo
+	if err := tearpc.Register(&foo); err != nil {
+		log.Fatal("register error")
+	}
+
+	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Println("Start server failed: ", err.Error())
 		return
 	}
-	log.Println("Server: Listen on: ", listener.Addr().String())
-	addr <- listener.Addr().String()
-	tearpc.Accept(listener)
-	log.Println("ServerFinish")
+	log.Println("Server: Listen on: ", l.Addr().String())
+	addr <- l.Addr().String()
+	tearpc.Accept(l)
+
 }
 
 func main() {
-	addr := make(chan string, 1)
+	log.SetFlags(0)
+	addr := make(chan string)
 	go startServer(addr)
 
 	time.Sleep(time.Second)
@@ -31,14 +43,17 @@ func main() {
 	defer func() { _ = client.Close() }()
 
 	var wg sync.WaitGroup
-	for i := 1; i < 5; i++ {
+	for i := 1; i < 50; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			var reply string // 每次发请求的时候,清空
+			var reply int // 每次发请求的时候,清空
 
-			client.Call("Foo.Sum", fmt.Sprintf("Test Argv of call [%v]", i), &reply) // 这里是阻塞的
-			log.Printf("i=%d, reply=%v", i, reply)
+			args := Args{Num1: i, Num2: i * i * i}
+			if err := client.Call("Foo.Sum", args, &reply); err != nil { // 这里是阻塞的
+				log.Fatal("call Foo.Sum error:", err)
+			}
+			log.Printf("Client: receive reply: %d + %d = %d", args.Num1, args.Num2, reply)
 		}(i)
 	}
 	wg.Wait()

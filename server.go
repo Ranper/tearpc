@@ -2,13 +2,15 @@ package tearpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"tearpc/codec" // 以最后一个/后面的内容作为imported 的name
+	"time"
 )
 
 const DefaultMagicNumber = 0x8df2ce
@@ -19,23 +21,30 @@ const DefaultMagicNumber = 0x8df2ce
 这里为了简单, 使用json传输协议协商
 */
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration // 0 means no limit
+	HandleTimeout  time.Duration
 }
 
 // 提供的默认选项
 var DefaultOption = &Option{ //? 所以这里使用指针的原因是?
-	MagicNumber: DefaultMagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    DefaultMagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 // 封装一次rpc调用, 固定参数服务名,方法名,错误封装在header里. 输入参数和返回参数在body
-type Request struct {
+type request struct {
 	Header          *codec.Header
-	Argv, ReplyArgv reflect.Value // 这里是reflect.Value ,思考下为什么不能是Type
+	Argv, ReplyArgv reflect.Value // 这里是reflect.Value ,思考下为什么不能是Type //因为这里保存的是具体的值,后续要操作的,不是要使用类型
+	mtype           *methodType   // 本次请求要调用的方法名
+	svc             *service      // 本次请求要调用的服务名
 }
 
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 // 构造函数, go语言中的结构体没有构造函数, 需要自己实现
 func NewServer() *Server {
@@ -66,7 +75,6 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 	log.Println("Server: Received Option! codec: ", opt.CodecType)
 	s.serveCodec(createCodecFunc(conn)) // 构造编码器,传入loop
-	// s.readRequest(createCodecFunc(conn))
 }
 
 var invalidRequest = struct{}{} // 初始化一个空结构体
@@ -81,7 +89,7 @@ var testStruct = TestStruct{
 	Name: "zhangsan",
 }
 
-// 三次握手, 发送opt选项之后, 在这里主循环, 接受 Request && handle request
+// 三次握手, 发送opt选项之后, 在这里主循环, 接受 request && handle request
 func (s *Server) serveCodec(cc codec.Codec) {
 	// defer func() { _ = cc.Close() }() // 退出的时候关闭cc
 	// 同一个conn 连接, 同一时间, 不同goroutine 只能有一个在写
@@ -123,35 +131,66 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *Request, wg *sync.WaitGroup, sending *sync.Mutex) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, wg *sync.WaitGroup, sending *sync.Mutex) {
 	// req.ReplyArgv = reflect.New(reflect.TypeOf(""))
 	defer wg.Done() // 走完整个处理流程后执行 wg.Done,defer是在本函数退出的时候才执行
 
-	req.ReplyArgv = reflect.ValueOf(fmt.Sprintf("TeaRpc Replay: %v", req.Header.Seq))
-	log.Printf("handleRequest: req.Seq=%d, argv=%v, Reply=%s", req.Header.Seq, req.Argv.Elem(), req.ReplyArgv)
-	// send response
+	// 直接调用对应服务的call 方法
+	err := req.svc.call(req.mtype, req.Argv, req.ReplyArgv)
+	if err != nil {
+		req.Header.Error = err.Error()
+		s.sendResponse(cc, req.Header, invalidRequest, sending)
+		return
+	}
+
 	s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+
+	// req.ReplyArgv = reflect.ValueOf(fmt.Sprintf("TeaRpc Replay: %v", req.Header.Seq))
+	// log.Printf("handleRequest: req.Seq=%d, argv=%v, Reply=%s", req.Header.Seq, req.Argv.Elem(), req.ReplyArgv)
+	// // send response
+	// s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+
 }
 
 /*
 读取请求
 */
-func (s *Server) readRequest(cc codec.Codec) (*Request, error) {
+func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	// 读取head
 	h, err := s.readRequsetHead(cc)
 	if err != nil {
 		return nil, err
 	}
-	req := &Request{Header: h}
-	//! 这里的反射还得再学习
-	// 假设参数类型是字符串
-	req.Argv = reflect.New(reflect.TypeOf("")) // 假设是字符串类型的输入,创建一个string类型的
-	if err := cc.ReadBody(req.Argv.Interface()); err != nil {
-		log.Println("readRequest: ReadBody err: ", err.Error())
+	req := &request{Header: h}
+	req.svc, req.mtype, err = s.findServer(h.ServerMethod) //!这里如果出现问题了, body就不读了么??那下次再读的时候,不会粘包么
+	if err != nil {
 		return req, err
 	}
-	// log.Println("Server receive argv:", req.Argv.Elem())
+
+	req.Argv = req.mtype.newArgv()
+	req.ReplyArgv = req.mtype.newReplyv()
+
+	argvi := req.Argv.Interface()
+	// 确保argv是个指针, 如果不是, 则获取其指针形式
+	if req.Argv.Type().Kind() != reflect.Ptr {
+		argvi = req.Argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err: ", err)
+		return req, err
+	}
+
 	return req, nil
+
+	// //! 这里的反射还得再学习
+	// // 假设参数类型是字符串
+	// req.Argv = reflect.New(reflect.TypeOf("")) // 假设是字符串类型的输入,创建一个string类型的
+	// if err := cc.ReadBody(req.Argv.Interface()); err != nil {
+	// 	log.Println("readRequest: ReadBody err: ", err.Error())
+	// 	return req, err
+	// }
+	// // log.Println("Server receive argv:", req.Argv.Elem())
+	// return req, nil
 }
 
 func (s *Server) readRequsetHead(cc codec.Codec) (*codec.Header, error) {
@@ -182,4 +221,36 @@ func (s *Server) Accept(listener net.Listener) {
 
 func Accept(listener net.Listener) {
 	DefaultServer.Accept(listener)
+}
+
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: serivce already defined: " + s.name)
+	}
+	return nil
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+func (server *Server) findServer(serviceMthod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMthod, ".")
+	if dot < 0 {
+		err = errors.New("rpc service: service/method request ill-formed: " + serviceMthod)
+		return
+	}
+
+	serviceName, methodName := serviceMthod[:dot], serviceMthod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName) // Load函数返回的是interface, 需要断言
+	if !ok {
+		err = errors.New("rpc service: can't find service " + serviceName)
+		return
+	}
+	svc = svci.(*service) // 断言为对应的服务指针
+	mtype = svc.method[methodName]
+	if mtype == nil { // mtype是个指针类型
+		err = errors.New("rpc service: can't find method " + methodName)
+		return
+	}
+	return
 }

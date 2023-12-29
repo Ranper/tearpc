@@ -193,6 +193,7 @@ func (c *Client) send(call *Call) *Call {
 	c.header.Seq = seq
 	c.header.Error = ""
 	c.header.ServerMethod = call.ServerMethod
+	// 注意, 这里只发送了 header 和 argv 参数, 服务器在读取的时候也只需要读这两部分就好了
 	if err := c.cc.Write(c.header, call.Argv); err != nil {
 		log.Println("Client Write err: ", err.Error())
 		call := c.removeCall(seq) // 这里发送失败要立即通知调用方哦

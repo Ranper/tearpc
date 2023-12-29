@@ -273,3 +273,18 @@ func (c *Client) Close() error {
 	c.closing = true
 	return c.cc.Close()
 }
+
+// day4 超时
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+/*
+https://geektutu.com/post/geerpc-day4.html
+未完
+*/
+// func dialTimeout(f newClientFunc, )

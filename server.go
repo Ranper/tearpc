@@ -3,6 +3,7 @@ package tearpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -93,7 +94,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 	log.Println("Server: Received Option! codec: ", opt.CodecType)
-	s.serveCodec(createCodecFunc(conn)) // 构造编码器,传入loop
+	s.serveCodec(createCodecFunc(conn), &opt) // 构造编码器,传入loop
 }
 
 var invalidRequest = struct{}{} // 初始化一个空结构体
@@ -109,7 +110,7 @@ var testStruct = TestStruct{
 }
 
 // 三次握手, 发送opt选项之后, 在这里主循环, 接受 request && handle request
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	// defer func() { _ = cc.Close() }() // 退出的时候关闭cc
 	// 同一个conn 连接, 同一时间, 不同goroutine 只能有一个在写
 	sending := &sync.Mutex{} // 每个conn 连接,对应一把锁
@@ -131,7 +132,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 		}
 
 		wg.Add(1)
-		go s.handleRequest(cc, req, wg, sending) // 处理请求和回复请求在其他协程, 所以每次在写数据的时候都需要加锁
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout) // 处理请求和回复请求在其他协程, 所以每次在写数据的时候都需要加锁
 	}
 	wg.Wait() // 等所有的协程都处理完了,再关闭连接
 	log.Println("conn close")
@@ -150,25 +151,55 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, wg *sync.WaitGroup, sending *sync.Mutex) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// req.ReplyArgv = reflect.New(reflect.TypeOf(""))
-	defer wg.Done() // 走完整个处理流程后执行 wg.Done,defer是在本函数退出的时候才执行
+	defer wg.Done()               // 走完整个处理流程后执行 wg.Done,defer是在本函数退出的时候才执行
+	called := make(chan struct{}) // 防止在call之后,发送response的时候超时, 又发送了一次response
+	sent := make(chan struct{})
 
-	// 直接调用对应服务的call 方法
-	err := req.svc.call(req.mtype, req.Argv, req.ReplyArgv)
-	if err != nil {
-		req.Header.Error = err.Error()
-		s.sendResponse(cc, req.Header, invalidRequest, sending)
+	go func() {
+		err := req.svc.call(req.mtype, req.Argv, req.ReplyArgv)
+		called <- struct{}{} // 通知已经完成调用
+
+		if err != nil {
+			req.Header.Error = err.Error()
+			s.sendResponse(cc, req.Header, invalidRequest, sending)
+			sent <- struct{}{}
+		}
+		s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
 
-	s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.Header.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.Header, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 
-	// req.ReplyArgv = reflect.ValueOf(fmt.Sprintf("TeaRpc Replay: %v", req.Header.Seq))
-	// log.Printf("handleRequest: req.Seq=%d, argv=%v, Reply=%s", req.Header.Seq, req.Argv.Elem(), req.ReplyArgv)
-	// // send response
-	// s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+	/*
+		// 直接调用对应服务的call 方法
+		err := req.svc.call(req.mtype, req.Argv, req.ReplyArgv)
+		if err != nil {
+			req.Header.Error = err.Error()
+			s.sendResponse(cc, req.Header, invalidRequest, sending)
+			return
+		}
 
+		s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+
+		// req.ReplyArgv = reflect.ValueOf(fmt.Sprintf("TeaRpc Replay: %v", req.Header.Seq))
+		// log.Printf("handleRequest: req.Seq=%d, argv=%v, Reply=%s", req.Header.Seq, req.Argv.Elem(), req.ReplyArgv)
+		// // send response
+		// s.sendResponse(cc, req.Header, req.ReplyArgv.Interface(), sending)
+	*/
 }
 
 /*

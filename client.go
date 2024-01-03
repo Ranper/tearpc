@@ -1,10 +1,10 @@
 package tearpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
@@ -59,7 +59,12 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 }
 
 // 根据opt, 在已经建立连接的socket上建立client对象
-func NewClient(conn io.ReadWriteCloser, opt *Option) (client *Client, err error) {
+/*
+	1、选择编码方式
+	2、跟服务器协商通信编码(向服务器发送数据)
+	3、创建Client结构体
+*/
+func NewClient(conn net.Conn, opt *Option) (client *Client, err error) {
 	createCodecFunc := codec.NewCodecFuncMap[opt.CodecType]
 	if createCodecFunc == nil {
 		err := fmt.Errorf("NewClient: invalid codec type %s", opt.CodecType)
@@ -100,6 +105,7 @@ func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Cal
 	return call
 }
 
+/*
 // 阻塞调用
 func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
 	// if call.Done == nil {
@@ -111,7 +117,27 @@ func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
 
 	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
 	return call.Error
+}
+*/
+/*
+用户可以使用 context.WithTimeout 创建具备超时检测能力的 context 对象来控制。例如：
+	ctx, _ := context.WithTimeout(context.Background(), time.Second)
+	var reply int
+	err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+	...
+*/
 
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1)) // 非阻塞
+	// 看看超时和rpc调用哪个先完成
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		log.Println("client Call timeout: call.Seq = ", call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case _call := <-call.Done: // 这里可能会名字冲突
+		return _call.Error
+	}
 }
 
 func Done(call *Call) {
@@ -123,6 +149,7 @@ func (c *Client) removeCall(seqId uint64) *Call {
 	defer c.mu.Unlock()
 	call := c.pending[seqId] // 从pending列表里面删除对应的序列号
 	delete(c.pending, seqId)
+	log.Printf("remove %v, call == nil ? %v, client = %p", seqId, call == nil, c)
 	return call
 }
 
@@ -144,7 +171,7 @@ func receive(client *Client, cc codec.Codec) {
 
 		switch { // swich 是可以不带表达式的,直接在case里面判断
 		case call == nil:
-			log.Printf("call [is = %v] is not in client.pending", header.Seq)
+			log.Printf("call [seq = %v] is not in client.pending %p", header.Seq, client)
 			err = cc.ReadBody(nil)
 		case header.Error != "":
 			log.Printf("receive: ReadBody: err: %v", header.Error)
@@ -155,9 +182,11 @@ func receive(client *Client, cc codec.Codec) {
 
 				当客户端试图读取的类型与服务器写入的类型不一致时
 			*/
+			call.Error = fmt.Errorf(header.Error) // 将error通过string传输,现在再转换为对应的error
 			err = cc.ReadBody(nil)
 			call.done()
 		case header.Error == "":
+			log.Printf("receive: ReadBody Error = empty")
 			err = cc.ReadBody(call.Reply) //从body中读取数据到 call.replay中
 			call.done()
 		}
@@ -220,6 +249,7 @@ func (c *Client) registerCall(call *Call) (uint64, error) {
 	call.Seq = c.seq
 	c.seq++
 	c.pending[call.Seq] = call
+	log.Printf("registerCall client.seq=%v, client.seq=%v call==nil ? %v client=%p", call.Seq, c.seq, call == nil, c)
 
 	return call.Seq, nil
 }
@@ -241,13 +271,14 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
+/*
 // dial 服务器, 发送opt
 func Dial(work string, addr chan string, opts ...*Option) (client *Client, err error) {
 	option, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-
+	// 这里可能会超时
 	conn, err := net.Dial(work, <-addr)
 	if err != nil {
 		log.Println("Dial failed")
@@ -260,8 +291,13 @@ func Dial(work string, addr chan string, opts ...*Option) (client *Client, err e
 			conn.Close()
 		}
 	}()
-
+	// 这里也可能会超时
 	return NewClient(conn, option)
+}
+*/
+
+func Dial(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 func (c *Client) Close() error {
@@ -276,6 +312,7 @@ func (c *Client) Close() error {
 
 // day4 超时
 
+// 将要传递的数据封装为一个结构体
 type clientResult struct {
 	client *Client
 	err    error
@@ -285,6 +322,44 @@ type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 /*
 https://geektutu.com/post/geerpc-day4.html
-未完
+带超时的建立连接
+1、解析option
+2、带超时的建立连接 DialTimeout
+3、使用通道实现NewClient的超时(主要是发送协商数据)
 */
-// func dialTimeout(f newClientFunc, )
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// 此时已经建立连接, 如果后续出什么错误, 要关闭连接
+	defer func() {
+		if err != nil {
+			_ = conn.Close() // 强调ignore错误
+		}
+	}()
+
+	ch := make(chan clientResult)
+	go func() {
+		client, err = f(conn, opt)
+		ch <- clientResult{client: client, err: err} // 通过chan通知创建client的结果
+	}()
+
+	if opt.ConnectTimeout == 0 { // 如果是没有超时, 直接读取ch即可. 另一个协程写入成功了这里即可读取到,然后返回
+		result := <-ch
+		return result.client, result.err
+	}
+
+	// 创建客户端超时
+	select { // 没有default语句,select 语句会阻塞,直到其中一个case 为真,如果同时为真, 随机选择一个
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}

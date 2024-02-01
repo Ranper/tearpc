@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -58,7 +59,7 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return client
 }
 
-// 根据opt, 在已经建立连接的socket上建立client对象
+// NewClient 根据opt, 在已经建立连接的socket上建立client对象
 /*
 	1、选择编码方式
 	2、跟服务器协商通信编码(向服务器发送数据)
@@ -86,7 +87,7 @@ func funcTimeCost() func(string) {
 	}
 }
 
-// 封装异步调用
+// Go 封装异步调用
 // 在内部构造 call 结构体
 func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Call) *Call {
 	// 因为使用了有缓冲的channel, 所以是非阻塞的
@@ -362,4 +363,8 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 	case result := <-ch:
 		return result.client, result.err
 	}
+}
+
+func NewHTTPClient(conn net.Conn, opt *Option) (*Clinet, error) {
+	_, _ = io.WriteString(conn)
 }

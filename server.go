@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -34,6 +35,12 @@ GeeRPC 在 3 个地方添加了超时处理机制。分别是：
 */
 
 const DefaultMagicNumber = 0x8df2ce
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geerpc_"
+	defaultDebugPath = "/debug/geerpc"
+)
 
 // 通信伊始, 协商编码格式
 /*
@@ -273,17 +280,17 @@ func Accept(listener net.Listener) {
 	DefaultServer.Accept(listener)
 }
 
-func (server *Server) Register(rcvr interface{}) error {
-	s := newService(rcvr)
-	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
-		return errors.New("rpc: serivce already defined: " + s.name)
+func (s *Server) Register(rcvr interface{}) error {
+	server := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(server.name, server); dup {
+		return errors.New("rpc: serivce already defined: " + server.name)
 	}
 	return nil
 }
 
 func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
 
-func (server *Server) findServer(serviceMthod string) (svc *service, mtype *methodType, err error) {
+func (s *Server) findServer(serviceMthod string) (svc *service, mtype *methodType, err error) {
 	dot := strings.LastIndex(serviceMthod, ".")
 	if dot < 0 {
 		err = errors.New("rpc service: service/method request ill-formed: " + serviceMthod)
@@ -291,7 +298,7 @@ func (server *Server) findServer(serviceMthod string) (svc *service, mtype *meth
 	}
 
 	serviceName, methodName := serviceMthod[:dot], serviceMthod[dot+1:]
-	svci, ok := server.serviceMap.Load(serviceName) // Load函数返回的是interface, 需要断言
+	svci, ok := s.serviceMap.Load(serviceName) // Load函数返回的是interface, 需要断言
 	if !ok {
 		err = errors.New("rpc service: can't find service " + serviceName)
 		return
@@ -304,3 +311,37 @@ func (server *Server) findServer(serviceMthod string) (svc *service, mtype *meth
 	}
 	return
 }
+
+// 支持http协议，通过connect方法
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 只支持 CONNECT 方法
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content_Type", "text/plain;charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack() // 接管http服务
+
+	if err != nil {
+		log.Print("rpc hijacking ,", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+
+	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n") // 回包，告之连接成功，后续可以走rpc调用。 http只是提供了建立连接的作用
+
+	s.serveConn(conn)
+}
+
+/*
+package http
+// Handle registers the handler for the given pattern
+// in the DefaultServeMux.
+// The documentation for ServeMux explains how patterns are matched.
+func Handle(pattern string, handler Handler) { DefaultServeMux.Handle(pattern, handler) }
+
+type Handler interface {
+    ServeHTTP(w ResponseWriter, r *Request)
+}
+*/

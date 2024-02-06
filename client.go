@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"tearpc/codec"
 	"time"
@@ -59,7 +62,7 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return client
 }
 
-// 根据opt, 在已经建立连接的socket上建立client对象
+// NewClient 根据opt, 在已经建立连接的socket上建立client对象
 /*
 	1、选择编码方式
 	2、跟服务器协商通信编码(向服务器发送数据)
@@ -87,7 +90,7 @@ func funcTimeCost() func(string) {
 	}
 }
 
-// 封装异步调用
+// Go 封装异步调用
 // 在内部构造 call 结构体
 func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Call) *Call {
 	// 因为使用了有缓冲的channel, 所以是非阻塞的
@@ -367,11 +370,11 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 
 // NewHTTPClient new a Client instance via HTTP as transport protocol
 func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
-	_, _ = io.writestring(conn, fmt.Sprintf("Connect %s HTTP/1.0\n\n", defaultRPCPath))
+	_, _ = io.WriteString(conn, fmt.Sprintf("Connect %s HTTP/1.0\n\n", defaultRPCPath))
 
 	// Require successful HTTP response
 	// before swithing to RPC protocol.
-	resp, err := http.Readresponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
 	if err == nil && resp.Status == connected {
 		return NewClient(conn, opt)
 	}
@@ -380,4 +383,26 @@ func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 	}
 
 	return nil, err
+}
+
+// DialHTTP connects to an HTTP RPC server at the specified network
+// address listening on the default HTTP RPC path.
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp. unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
 }

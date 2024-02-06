@@ -3,9 +3,12 @@ package main
 import (
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"tearpc"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 type Foo int
@@ -29,7 +32,9 @@ func startServer(addr chan string) {
 	}
 	log.Println("Server: Listen on: ", l.Addr().String())
 	addr <- l.Addr().String()
-	tearpc.Accept(l)
+	// tearpc.Accept(l)
+	tearpc.HandleHTTP() // day5
+	_ = http.Serve(l, nil)
 
 }
 
@@ -39,7 +44,8 @@ func main() {
 	go startServer(addr)
 
 	time.Sleep(time.Second)
-	client, _ := tearpc.Dial("tcp", addr)
+	// client, _ := tearpc.Dial("tcp", addr)
+	client, _ := tearpc.DialHTTP("tcp", <-addr)
 	defer func() { _ = client.Close() }()
 
 	var wg sync.WaitGroup
@@ -50,7 +56,7 @@ func main() {
 			var reply int // 每次发请求的时候,清空
 
 			args := Args{Num1: i, Num2: i * i * i}
-			if err := client.Call("Foo.Sum", args, &reply); err != nil { // 这里是阻塞的
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil { // 这里是阻塞的
 				log.Fatal("call Foo.Sum error:", err)
 			}
 			log.Printf("Client: receive reply: %d + %d = %d", args.Num1, args.Num2, reply)

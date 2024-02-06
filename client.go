@@ -105,6 +105,9 @@ func (c *Client) Go(ServerMethon string, argv, reply interface{}, done chan *Cal
 		Reply:        reply,
 		Done:         done,
 	}
+	if c == nil {
+		log.Printf("client c is nil")
+	}
 	c.send(call)
 	return call
 }
@@ -370,11 +373,12 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 
 // NewHTTPClient new a Client instance via HTTP as transport protocol
 func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
-	_, _ = io.WriteString(conn, fmt.Sprintf("Connect %s HTTP/1.0\n\n", defaultRPCPath))
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
 
 	// Require successful HTTP response
 	// before swithing to RPC protocol.
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	log.Printf("resp=%v, err=%v", resp, err)
 	if err == nil && resp.Status == connected {
 		return NewClient(conn, opt)
 	}

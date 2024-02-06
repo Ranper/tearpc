@@ -329,16 +329,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n") // 回包，告之连接成功，后续可以走rpc调用。 http只是提供了建立连接的作用
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n") // 回包，告之连接成功，后续可以走rpc调用。 http只是提供了建立连接的作用
 
 	s.ServeConn(conn)
 }
 
 // HandleHTTP registers on HTTP handler for RPC messages on rpcPath
 // It is still necessary to invoke http.Serve(), typically in a go statement
-func (server *Server) HandleHTTP() {
-	http.Handle(defaultDebugPath, server)
-}
+// func (server *Server) HandleHTTP() {
+// 	http.Handle(defaultDebugPath, server)
+// }
 
 // HandleHTTP is a convenient approach for default server to register HTTP handles
 func HandleHTTP() {
